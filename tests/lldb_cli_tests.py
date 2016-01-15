@@ -30,6 +30,7 @@ log = logging.getLogger('tests')
 p = None
 client = None
 
+
 def setup():
     global p, client, pm
 
@@ -44,10 +45,12 @@ def setup():
     start_debugger()
     time.sleep(1)
 
+
 def teardown():
     read_data()
     p.terminate(True)
     time.sleep(2)
+
 
 def start_debugger(do_break=True):
     global p, client
@@ -63,10 +66,11 @@ def start_debugger(do_break=True):
     p.sendline("run loop")
     read_data()
     client = Client()
-    client.connect()
+
 
 def stop_debugger():
     p.terminate(True)
+
 
 def read_data():
     try:
@@ -75,9 +79,11 @@ def read_data():
     except:
         pass
 
+
 def restart_debugger(do_break=True):
     stop_debugger()
     start_debugger(do_break)
+
 
 def test_bad_request():
     req = client.create_request('version')
@@ -86,11 +92,13 @@ def test_bad_request():
     assert res.is_error
     assert res.code == 0x1002
 
+
 def test_version():
     req = client.create_request('version')
     res = client.send_request(req)
-    assert res.api_version == 1.0
+    assert res.api_version == 1.1
     assert 'lldb' in res.host_version
+
 
 def test_registers():
     global registers
@@ -103,12 +111,14 @@ def test_registers():
     assert len(registers) > 0
     assert registers['rip'] != 0
 
+
 def test_memory():
     restart_debugger()
     time.sleep(1)
     res = client.perform_request('memory', address=registers['rip'], length=0x40)
     assert res.status == 'success'
     assert len(res.memory) > 0
+
 
 def test_state_stopped():
     restart_debugger()
@@ -117,12 +127,6 @@ def test_state_stopped():
     assert res.is_success
     assert res.state == "stopped"
 
-def test_wait_timeout():
-    restart_debugger()
-    time.sleep(1)
-    res = client.perform_request('wait', timeout=2)
-    assert res.is_error
-    assert res.code == 0x1004
 
 def test_targets():
     restart_debugger()
@@ -134,12 +138,14 @@ def test_targets():
     assert res.targets[0]['id'] == 0
     assert res.targets[0]['file'].endswith('tests/inferior')
 
+
 def test_stack():
     restart_debugger()
     time.sleep(1)
     res = client.perform_request('stack', length=0x40)
     assert res.status == 'success'
     assert len(res.memory) > 0
+
 
 def test_command():
     restart_debugger()
@@ -149,6 +155,7 @@ def test_command():
     assert len(res.output) > 0
     assert 'rax' in res.output
 
+
 def test_disassemble():
     restart_debugger()
     time.sleep(1)
@@ -156,6 +163,7 @@ def test_disassemble():
     assert res.status == 'success'
     assert len(res.disassembly) > 0
     assert 'push' in res.disassembly
+
 
 def test_dereference():
     restart_debugger()
@@ -165,6 +173,7 @@ def test_dereference():
     assert res.status == 'success'
     assert res.output[0][0] == 'pointer'
     assert res.output[-1][1] == 'start + 0x1'
+
 
 def test_breakpoints():
     restart_debugger()
@@ -177,3 +186,38 @@ def test_breakpoints():
     assert res.breakpoints[0]['id'] == 1
     assert res.breakpoints[0]['hit_count'] > 0
     assert res.breakpoints[0]['locations'][0]['name'] == "inferior`main"
+
+
+def test_multi():
+    global r1, r2
+    restart_debugger(True)
+    time.sleep(1)
+    r1, r2 = None, None
+
+    def send_req():
+        global r1, r2
+        r1, r2 = client.send_requests(api_request('targets', block=True), api_request('registers', block=True))
+        print "sent requests"
+
+    t = threading.Thread(target=send_req)
+    t.start()
+    time.sleep(5)
+    p.sendline("stepi")
+    time.sleep(5)
+    t.join()
+    print r1
+    print r2
+    assert r1.is_success
+    assert r1.targets[0]['state'] == "stopped"
+    assert r1.targets[0]['arch'] == "x86_64"
+    assert r1.targets[0]['id'] == 0
+    assert r1.targets[0]['file'].endswith('tests/inferior')
+    assert r2.status == 'success'
+    assert len(r2.registers) > 0
+    assert r2.registers['rip'] != 0
+
+
+def test_capabilities():
+    restart_debugger(True)
+    res = client.perform_request('version')
+    assert res.capabilities == ['async']

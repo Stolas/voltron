@@ -3,6 +3,7 @@ from __future__ import print_function
 import struct
 import logging
 import threading
+import codecs
 from collections import namedtuple
 
 from voltron.api import *
@@ -188,7 +189,6 @@ if HAVE_LLDB:
                 raise Exception("Unsupported architecture: {}".format(t_info['arch']))
 
             # get the registers
-            log.warn("thing: {}".format(registers))
             regs = thread.GetFrameAtIndex(0).GetRegisters()
 
             # extract the actual register values
@@ -198,11 +198,18 @@ if HAVE_LLDB:
             regs = {}
             for reg in objs:
                 val = 'n/a'
-                if reg.value != None:
+                if reg.value is not None:
                     try:
                         val = reg.GetValueAsUnsigned()
                     except:
                         reg = None
+                elif reg.num_children > 0:
+                    children = []
+                    for i in xrange(reg.GetNumChildren()):
+                        children.append(int(reg.GetChildAtIndex(i, lldb.eNoDynamicValues, True).value, 16))
+                    if t_info['byte_order'] == 'big':
+                        children = list(reversed(children))
+                    val = int(codecs.encode(struct.pack('{}B'.format(len(children)), *children), 'hex'), 16)
                 if registers == [] or reg.name in registers:
                     regs[reg.name] = val
 
@@ -344,6 +351,9 @@ if HAVE_LLDB:
                 else:
                     break
 
+            if len(chain) == 0:
+                raise InvalidPointerError("0x{:X} is not a valid pointer".format(pointer))
+
             # get some info for the last pointer
             # first try to resolve a symbol context for the address
             p, addr = chain[-1]
@@ -407,7 +417,6 @@ if HAVE_LLDB:
 
             return flavor
 
-
         @validate_busy
         @validate_target
         @lock_host
@@ -458,6 +467,17 @@ if HAVE_LLDB:
                 })
 
             return breakpoints
+
+        def capabilities(self):
+            """
+            Return a list of the debugger's capabilities.
+
+            Thus far only the 'async' capability is supported. This indicates
+            that the debugger host can be queried from a background thread,
+            and that views can use non-blocking API requests without queueing
+            requests to be dispatched next time the debugger stops.
+            """
+            return ["async"]
 
         def register_command_plugin(self, name, cls):
             """

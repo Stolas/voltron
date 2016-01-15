@@ -83,7 +83,7 @@ try:
     def test_registers():
         process = target.LaunchSimple(None, None, os.getcwd())
         regs = adaptor.registers()
-        assert regs != None
+        assert regs is not None
         assert len(regs) > 0
         assert regs['rip'] != 0
         process.Destroy()
@@ -143,7 +143,7 @@ try:
     def test_dereference_string():
         process = target.LaunchSimple(None, None, os.getcwd())
         regs = adaptor.registers()
-        output = adaptor.dereference(regs['rsp']+0x20)
+        output = adaptor.dereference(regs['rsp'] + 0x20)
         assert 'inferior' in list(output[-1])[-1]
         process.Destroy()
 
@@ -156,6 +156,10 @@ try:
         assert bps[0]['id'] == 1
         assert bps[0]['hit_count'] > 0
         assert bps[0]['locations'][0]['name'] == "inferior`main"
-        process.Destroy()    
+        process.Destroy()
+
+    def test_capabilities():
+        assert adaptor.capabilities() == ['async']
+
 except:
     print("No LLDB")

@@ -20,9 +20,12 @@ class CommandView (TerminalView):
         self.title = '[cmd:' + self.args.command + ']'
 
         # Get the command output
-        req = api_request('command')
-        req.command = self.args.command
-        res = self.client.send_request(req)
+        res = self.client.perform_request('command', block=self.block, command=self.args.command)
+
+        # don't render if it timed out, probably haven't stepped the debugger again
+        if res.timed_out:
+            return
+
         if res and res.is_success:
             # Get the command output
             self.body = res.output

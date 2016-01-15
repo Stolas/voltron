@@ -15,9 +15,14 @@ class DisasmView (TerminalView):
         self.title = '[code]'
 
         # Request data
-        req = api_request('disassemble')
+        req = api_request('disassemble', block=self.block)
         req.count = self.body_height()
         res = self.client.send_request(req)
+
+        # don't render if it timed out, probably haven't stepped the debugger again
+        if res.timed_out:
+            return
+
         if res and res.is_success:
             # Get the disasm
             disasm = res.disassembly

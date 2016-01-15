@@ -4,6 +4,7 @@ import logging
 import threading
 import re
 import struct
+import six
 
 from voltron.api import *
 from voltron.plugin import *
@@ -268,7 +269,7 @@ if HAVE_GDB:
             while True:
                 try:
                     mem = gdb.selected_inferior().read_memory(addr, self.get_addr_size())
-                    log.debug("read mem: {}".format(mem))
+                    # log.debug("read mem: {}".format(mem))
                     (ptr,) = struct.unpack(fmt, mem)
                     if ptr in chain:
                         break
@@ -284,14 +285,14 @@ if HAVE_GDB:
                 p, addr = chain[-1]
                 output = gdb.execute('info symbol {}'.format(addr), to_string=True)
                 if 'No symbol matches' not in output:
-                    chain.append(('symbol', output))
+                    chain.append(('symbol', output.strip()))
                     log.debug("symbol context: {}".format(str(chain[-1])))
                 else:
                     log.debug("no symbol context")
                     mem = gdb.selected_inferior().read_memory(addr, 1)
                     if ord(mem[0]) < 127:
                         output = gdb.execute('x/s 0x{:X}'.format(addr), to_string=True)
-                        chain.append(('string', '"'.join(output.split('"')[1:-1])))
+                        chain.append(('string', '"'.join(output.split('"')[1:-1]).strip()))
 
             log.debug("chain: {}".format(chain))
             return chain
@@ -372,6 +373,17 @@ if HAVE_GDB:
                 })
 
             return breakpoints
+
+            def capabilities(self):
+                """
+                Return a list of the debugger's capabilities.
+
+                Thus far only the 'async' capability is supported. This indicates
+                that the debugger host can be queried from a background thread,
+                and that views can use non-blocking API requests without queueing
+                requests to be dispatched next time the debugger stops.
+                """
+                return []
 
         #
         # Private functions
@@ -471,12 +483,18 @@ if HAVE_GDB:
                 vals['eflags'] = 'N/A'
 
             # Get SSE registers
-            sse = self.get_registers_sse(8)
-            vals = dict(list(vals.items()) + list(sse.items()))
+            try:
+                sse = self.get_registers_sse(8)
+                vals = dict(list(vals.items()) + list(sse.items()))
+            except gdb.error:
+                log.exception("Failed to get SSE registers")
 
             # Get FPU registers
-            fpu = self.get_registers_fpu()
-            vals = dict(list(vals.items()) + list(fpu.items()))
+            try:
+                fpu = self.get_registers_fpu()
+                vals = dict(list(vals.items()) + list(fpu.items()))
+            except gdb.error:
+                log.exception("Failed to get SSE registers")
 
             return vals
 

@@ -290,53 +290,53 @@ class RegisterView (TerminalView):
         if self.args.orientation != None:
             self.config.orientation = self.args.orientation
         if self.args.sections != None:
-            a = filter(lambda x: 'no_'+x not in self.args.sections and not x.startswith('no_'), self.config.sections + self.args.sections)
-            self.config.sections = []
+            a = filter(lambda x: 'no_'+x not in self.args.sections and not x.startswith('no_'), list(self.config.sections) + self.args.sections)
+            config_sections = []
             for sec in a:
-                if sec not in self.config.sections:
-                    self.config.sections.append(sec)
+                if sec not in config_sections:
+                    config_sections.append(sec)
+            self.config.sections = config_sections
 
     def render(self):
         error = None
 
         # get target info (ie. arch)
-        res = self.client.perform_request('targets')
-        if res.is_error:
-            error = "Failed getting targets: {}".format(res.message)
+        t_res, d_res, r_res = self.client.send_requests(api_request('targets', block=self.block),
+                                                        api_request('disassemble', count=1, block=self.block),
+                                                        api_request('registers', block=self.block))
+
+        # don't render if it timed out, probably haven't stepped the debugger again
+        if t_res.timed_out:
+            return
+
+        if t_res and t_res.is_error or t_res is None or t_res and len(t_res.targets) == 0:
+            error = "No such target"
         else:
-            if len(res.targets) == 0:
-                error = "No targets in debugger"
+            arch = t_res.targets[0]['arch']
+            self.curr_arch = arch
+
+            # ensure the architecture is supported
+            if arch not in self.FORMAT_INFO:
+                error = "Architecture '{}' not supported".format(arch)
             else:
-                arch = res.targets[0]['arch']
-                self.curr_arch = arch
+                # get next instruction
+                try:
+                    self.curr_inst = d_res.disassembly.strip().split('\n')[-1].split(':')[1].strip()
+                except:
+                    self.curr_inst = None
 
-                # ensure the architecture is supported
-                if arch not in self.FORMAT_INFO:
-                    error = "Architecture '{}' not supported".format(arch)
-                else:
-                    # get next instruction
-                    res = self.client.perform_request('disassemble', count=1)
-                    try:
-                        self.curr_inst = res.disassembly.strip().split('\n')[-1].split(':')[1].strip()
-                    except:
-                        self.curr_inst = None
-
-                    # get registers for target
-                    res = self.client.perform_request('registers')
-                    if res.is_error:
-                        error = "Failed getting registers: {}".format(res.message)
+                # get registers for target
+                if r_res.is_error:
+                    error = r_res.message
 
         # if everything is ok, render the view
         if not error:
-            # Store current response
-            self.curr_res = res
-
             # Build template
             template = '\n'.join(map(lambda x: self.TEMPLATES[arch][self.config.orientation][x], self.config.sections))
 
             # Process formatting settings
             data = defaultdict(lambda: 'n/a')
-            data.update(res.registers)
+            data.update(r_res.registers)
             formats = self.FORMAT_INFO[arch]
             formatted = {}
             for fmt in formats:
@@ -540,9 +540,7 @@ class RegisterView (TerminalView):
             jump = ''
 
         # Pad out
-        height, width = self.window_size()
-        t = '{:^%d}' % (width - 2)
-        jump = t.format(jump)
+        jump = '{:^19}'.format(jump)
 
         # Colour
         if j is not None:

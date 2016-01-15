@@ -8,17 +8,32 @@ import threading
 import logging
 import logging.config
 import json
-import cherrypy
+try:
+    import requests_unixsocket as requests
+except:
+    import requests
+import threading
+import os.path
+
+import six
+if six.PY2:
+    from SocketServer import UnixStreamServer, ThreadingMixIn
+    from BaseHTTPServer import HTTPServer
+else:
+    from six.moves.socketserver import UnixStreamServer, ThreadingMixIn
+    from six.moves.BaseHTTPServer import HTTPServer
+
+from werkzeug.serving import WSGIRequestHandler, BaseWSGIServer, ThreadedWSGIServer
+from werkzeug.wsgi import SharedDataMiddleware, DispatcherMiddleware
+
+from flask import Flask, request, Response, render_template, make_response
 
 import voltron
-import voltron.http
 from .api import *
 from .plugin import *
-from .api import *
+from .web.ui import app as ui_app
 
 log = logging.getLogger("core")
-
-READ_MAX = 0xFFFF
 
 if sys.version_info.major == 2:
     STRTYPES = (str, unicode)
@@ -28,6 +43,7 @@ else:
     raise RuntimeError("Not sure what strings look like on python %d" %
                        sys.version_info.major)
 
+
 class Server(object):
     """
     Main server class instantiated by the debugger host. Responsible for
@@ -35,66 +51,65 @@ class Server(object):
     handling requests forwarded from that thread.
     """
     def __init__(self):
-        self.clients = []
-
-        self.d_thread = None
-        self.t_thread = None
-        self.h_thread = None
-
-        # pipes for controlling ServerThreads
-        self.d_exit_out, self.d_exit_in = os.pipe()
-        self.t_exit_out, self.t_exit_in = os.pipe()
-
+        self.threads = []
+        self.listeners = []
         self.is_running = False
+        self.queue = []
 
     def start(self):
-        listen = voltron.config['server']['listen']
-        if listen['domain']:
-            log.debug("Starting server thread for domain socket")
-            self.d_thread = ServerThread(self, self.clients, self.d_exit_out, voltron.env.voltron_dir.sock.path)
-            self.d_thread.start()
-        if listen['tcp']:
-            log.debug("Starting server thread for TCP socket")
-            self.t_thread = ServerThread(self, self.clients, self.t_exit_out, tuple(listen['tcp']))
-            self.t_thread.start()
-        if voltron.config['server']['listen']['http']:
-            log.debug("Starting server thread for HTTP server")
-            (host, port) = tuple(listen['http'])
-            voltron.http.app.server = self
-            self.h_thread = HTTPServerThread(self, self.clients, host, port)
-            self.h_thread.start()
+        """
+        Start the server.
+        """
+        plugins = voltron.plugin.pm.web_plugins
+        self.app = DispatcherMiddleware(
+            VoltronFlaskApp('voltron', template_folder='web/templates', static_folder='web/static', server=self),
+            {
+                "/view": SharedDataMiddleware(
+                    None,
+                    {'/{}'.format(n): os.path.join(p._dir, 'static') for (n, p) in six.iteritems(plugins)}
+                ),
+                "/ui": ui_app
+            }
+        )
+
+        def run_listener(name, cls, arg):
+            log.debug("Starting listener for {} socket on {}".format(name, str(arg)))
+            s = cls(*arg)
+            t = threading.Thread(target=s.serve_forever)
+            t.start()
+            self.threads.append(t)
+            self.listeners.append(s)
+
+        if voltron.config.server.listen.tcp:
+            run_listener('tcp', ThreadedVoltronWSGIServer, list(voltron.config.server.listen.tcp) + [self.app])
+
+        if voltron.config.server.listen.domain:
+            path = os.path.expanduser(str(voltron.config.server.listen.domain))
+            try:
+                os.unlink(path)
+            except:
+                pass
+            run_listener('domain', ThreadedUnixWSGIServer, [path, self.app])
+
         self.is_running = True
 
     def stop(self):
-        # terminate the server thread by writing some data to the exit pipe
-        log.debug("Stopping server threads")
-        if self.d_thread:
-            log.debug("Stopping domain socket thread")
-            os.write(self.d_exit_in, chr(0).encode('UTF-8'))
-            self.d_thread.join(10)
-        if self.t_thread:
-            log.debug("Stopping TCP socket thread")
-            os.write(self.t_exit_in, chr(0).encode('UTF-8'))
-            self.t_thread.join(10)
-        if self.h_thread:
-            log.debug("Stopping HTTP server")
-            self.h_thread.stop()
+        """
+        Stop the server.
+        """
+        log.debug("Stopping listeners")
+        for s in self.listeners:
+            s.shutdown()
+            s.socket.close()
+        for t in self.threads:
+            t.join()
+        self.listeners = []
+        self.threads = []
         self.is_running = False
-        log.debug("Finished stopping server threads")
 
-    def client_summary(self):
-        sums = []
-        for client in self.clients:
-            sums.append(str(client))
-        return sums
-
-    def handle_request(self, data, client=None):
+    def handle_request(self, data):
         req = None
         res = None
-
-        #
-        # preprocess the request to make sure the data and environment are OK
-        #
 
         # make sure we have a debugger, or we're gonna have a bad time
         if voltron.debugger:
@@ -108,6 +123,7 @@ class Server(object):
             if req:
                 # instantiate the request class
                 try:
+                    log.debug("data = {}".format(data))
                     req = api_request(req.request, data=data)
                 except Exception as e:
                     log.exception("Exception raised while creating API request: {} {}".format(type(e), e))
@@ -119,30 +135,41 @@ class Server(object):
         else:
             res = APIDebuggerNotPresentErrorResponse()
 
-        #
-        # validate and dispatch the request
-        #
-
         if not res:
-            # dispatch the request and send the response
-            if req and req.request == 'wait':
-                # wait requests get handled in a background thread
-                t = threading.Thread(target=self.dispatch_request, args=[req, client])
-                t.start()
-            else:
-                # everything else is handled on the main thread
-                return self.dispatch_request(req, client)
-        else:
-            if client:
-                # already got an error response and we have a client, send it
-                try:
-                    client.send_response(str(res))
-                except socket.error:
-                    log.error("Client closed before we could respond")
-            else:
-                return res
+            # no errors so far, queue the request and wait
+            if req and req.block:
+                self.queue.append(req)
 
-    def dispatch_request(self, req, client=None):
+                # When this returns the request will have been processed by the dispatch_queue method on the main
+                # thread (or timed out). We have to do it this way because GDB sucks.
+                req.wait()
+
+                if req.timed_out:
+                    res = APITimedOutErrorResponse()
+                else:
+                    res = req.response
+
+                # Remove the request from the queue
+                if req in self.queue:
+                    self.queue.remove(req)
+            else:
+                # non-blocking, dispatch request straight away
+                res = self.dispatch_request(req)
+
+        return res
+
+    def dispatch_queue(self):
+        """
+        Dispatch any queued requests.
+
+        Called by the debugger when it stops.
+        """
+        log.debug("Dispatching requests: {}".format(self.queue))
+        for req in self.queue:
+            req.response = self.dispatch_request(req)
+            req.signal()
+
+    def dispatch_request(self, req):
         """
         Dispatch a request object.
         """
@@ -166,206 +193,128 @@ class Server(object):
 
         log.debug("Response: {}".format(str(res)))
 
-        # send the response
-        if client:
-            log.debug("Client was passed to dispatch_request() - sending response")
-            try:
-                client.send_response(str(res).encode('UTF-8'))
-            except socket.error:
-                log.error("Client closed before we could respond")
-        else:
-            log.debug("Client was not passed to dispatch_request() - returning response")
-            return res
+        return res
 
 
-class ServerThread(threading.Thread):
+class VoltronWSGIServer(BaseWSGIServer):
     """
-    Background thread spun off by the Server class. Responsible for
-    accepting new client connections and communicating with existing clients.
-    Requests are received from clients and passed to the Server object, which
-    passes them off to the APIDispatcher to be fulfilled. Then the responses
-    returned (synchronously) are sent back to the requesting client.
+    Custom version of the werkzeug WSGI server.
+
+    This just needs to exist so we can swallow errors when clients disconnect.
     """
-    def __init__(self, server, clients, exit_pipe, sock):
-        threading.Thread.__init__(self)
-        self.server = server
-        self.clients = clients
-        self.exit_pipe = exit_pipe
-        self.sock = sock
-
-    def run(self):
-        # make sure there's no left over socket file
-        self.cleanup_socket()
-
-        # set up the server socket
-        serv = ServerSocket(self.sock)
-
-        # main event loop
-        running = True
-        while running:
-            # check server accept() socket, exit pipe, and client sockets for activity
-            # Various signals used by the threading module aren't entirely safe
-            # and can leak out to interrupt out select call.
-            #
-            # Retrying the select(2) call is pretty safe, but in the interests
-            # of not locking up the debugger we'll only retry 3 times before
-            # reraising.
-            for i in range(3):
-                try:
-                    rfds, _, _ = select.select([serv, self.exit_pipe] + self.clients, [], [])
-                except select.error as ex:
-                    # sys.stderr.write("=========\nInterrupted by %s\n=========\n", repr(ex))
-                    if ex[0] == errno.EINTR: # interrupted system call
-                        if i != 2:
-                            continue
-                    raise
-
-            # handle any ready sockets
-            for fd in rfds:
-                if fd == serv:
-                    # accept a new client connection
-                    client = serv.accept()
-                    client.server = self.server
-                    self.clients.append(client)
-                elif fd == self.exit_pipe:
-                    # flush the exit pipe and break
-                    os.read(self.exit_pipe, 1)
-                    running = False
-                    break
-                else:
-                    # read the request from the client and dispatch it
-                    data = None
-                    try:
-                        data = fd.recv_request()
-                        self.server.handle_request(data, fd)
-                    except Exception as e:
-                        log.exception("Exception raised while handling request: {} {}".format(type(e), str(e)))
-                        self.purge_client(fd)
-
-        # clean up
-        log.debug("Cleaning up server thread")
-        for client in self.clients:
-            self.purge_client(client)
-        os.close(self.exit_pipe)
-        serv.close()
-        self.cleanup_socket()
-        log.debug("Exiting server thread")
-
-    def cleanup_socket(self):
-        if isinstance(self.sock, STRTYPES):
-            try:
-                os.remove(self.sock)
-            except:
-                pass
-
-    def purge_client(self, client):
+    def finish_request(self, *args):
         try:
-            client.close()
-        except:
-            pass
-        if client in self.clients:
-            self.clients.remove(client)
+            super(VoltronWSGIServer, self).finish_request(*args)
+        except socket.error as e:
+            log.error("Error in finish_request: {}".format(e))
 
 
-class HTTPServerThread(threading.Thread):
+class ThreadedVoltronWSGIServer(ThreadingMixIn, VoltronWSGIServer):
     """
-    Background thread to run the HTTP server.
+    Threaded WSGI server to replace werkzeug's
     """
-    def __init__(self, server, clients, host="127.0.0.1", port=6969):
-        threading.Thread.__init__(self)
-        self.server = server
-        self.clients = clients
-        self.host = host
-        self.port = port
+    pass
+
+
+class UnixWSGIServer(UnixStreamServer, VoltronWSGIServer):
+    """
+    A subclass of BaseWSGIServer that does sane things with Unix domain sockets.
+    """
+    def __init__(self, sockfile=None, app=None):
+        self.address_family = socket.AF_UNIX
+        UnixStreamServer.__init__(self, sockfile, UnixWSGIRequestHandler)
+        self.app = app
+        self.passthrough_errors = None
+        self.shutdown_signal = False
+        self.ssl_context = None
+
+
+class UnixWSGIRequestHandler(WSGIRequestHandler):
+    """
+    A WSGIRequestHandler that does sane things with Unix domain sockets.
+    """
+    def make_environ(self, *args, **kwargs):
+        self.client_address = ('127.0.0.1', 0)
+        return super(UnixWSGIRequestHandler, self).make_environ(*args, **kwargs)
+
+
+class ThreadedUnixWSGIServer(ThreadingMixIn, UnixWSGIServer):
+    """
+    Threaded HTTP server that works over Unix domain sockets.
+
+    Note: this intentionally does not inherit from HTTPServer. Go look at the
+    source and you'll see why.
+    """
+    multithread = True
+
+
+class VoltronFlaskApp(Flask):
+    """
+    A Voltron Flask app.
+    """
+    def __init__(self, *args, **kwargs):
+        if 'server' in kwargs:
+            self.server = kwargs['server']
+            del kwargs['server']
+        super(VoltronFlaskApp, self).__init__(*args, **kwargs)
+
+        def index():
+            return make_response(render_template('index.html', views=voltron.plugin.pm.web_plugins.keys()))
+
+        def api_post():
+            res = self.server.handle_request(request.data.decode('UTF-8'))
+            return Response(str(res), status=200, mimetype='application/json')
+
+        def api_get():
+            res = self.server.handle_request(str(api_request(request.path.split('/')[-1], **request.args.to_dict())))
+            return Response(str(res), status=200, mimetype='application/json')
+
+        # Show main page at index
+        self.add_url_rule('/', 'index', index)
+
+        # Handle API POST requests at /api/request
+        api_post.methods = ["POST"]
+        self.add_url_rule('/api/request', 'request', api_post)
+
+        # Handle API GET requests at /api/<request_name> e.g. /api/version
+        for plugin in voltron.plugin.pm.api_plugins:
+            self.add_url_rule('/api/{}'.format(plugin), plugin, api_get)
+
+
+class ClientThread(threading.Thread):
+    """
+    A thread that performs an API request with a client.
+    """
+    def __init__(self, client, request, *args, **kwargs):
+        self.request = request
+        self.response = None
+        self.exception = None
+        self.client = client
+        super(ClientThread, self).__init__(*args, **kwargs)
 
     def run(self):
-        # register routes for all the API methods
-        voltron.http.register_http_api()
-
-        # configure the cherrypy server
-        cherrypy.config.update({
-            'log.screen': False,
-            'server.socket_port': self.port,
-            'server.socket_host': str(self.host)
-        })
-
-        # mount the main static dir
-        cherrypy.tree.mount(None, '/static', {'/' : {
-            'tools.staticdir.dir': os.path.join(os.path.dirname(__file__), 'web/static'),
-            'tools.staticdir.on': True,
-            'tools.staticdir.index': 'index.html'
-        }})
-
-        # graft the main flask app (see http.py) onto the cherry tree
-        cherrypy.tree.graft(voltron.http.app, '/')
-
-        # mount web plugins
-        plugins = voltron.plugin.pm.web_plugins
-        for name in plugins:
-            plugin_root = '/view/{}'.format(name)
-            static_path = '/view/{}/static'.format(name)
-
-            # mount app
-            if plugins[name].app:
-                # if there's an app object, mount it at the root
-                log.debug("Mounting app for web plugin '{}' on {}".format(name, plugin_root))
-                plugins[name].app.server = self.server
-                cherrypy.tree.graft(plugins[name].app, plugin_root)
-            else:
-                # if there's no plugin app, mount the static dir at the plugin's root instead
-                # neater for static-only apps (ie. javascript-based)
-                static_path = plugin_root
-
-            # mount static directory
-            directory = os.path.join(plugins[name]._dir, 'static')
-            if os.path.isdir(directory):
-                log.debug("Mounting static directory for web plugin '{}' on {}: {}".format(name, static_path, directory))
-                cherrypy.tree.mount(None, static_path, {'/' : {
-                    'tools.staticdir.dir': directory,
-                    'tools.staticdir.on': True,
-                    'tools.staticdir.index': 'index.html'
-                }})
-
-
-        # make with the serving
-        cherrypy.engine.start()
-        cherrypy.engine.block()
-
-    def stop(self):
-        cherrypy.engine.exit()
-        log.debug("Killed cherrypy")
-
-
-class NotConnectedError(Exception): pass
+        try:
+            self.response = self.client.send_request(self.request)
+        except Exception as e:
+            self.exception = e
 
 
 class Client(object):
     """
     Used by a client (ie. a view) to communicate with the server.
     """
-    def __init__(self):
+    def __init__(self, host='127.0.0.1', port=5555, sockfile=None, url=None):
         """
         Initialise a new client
         """
-        self.sock = None
-
-    @property
-    def is_connected(self):
-        """
-        Return a boolean indicating whether or not the client is connected.
-        """
-        return self.sock != None
-
-    def connect(self):
-        """
-        Connect to the server
-        """
-        try:
-            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.sock.connect(voltron.env.voltron_dir.sock.path)
-        except Exception as e:
-            self.sock = None
-            raise
+        self.session = requests.Session()
+        if url:
+            self.url = url
+        elif sockfile:
+            self.url = 'http+unix://{}/api/request'.format(sockfile.replace('/', '%2F'))
+        else:
+            self.url = 'http://{}:{}/api/request'.format(host, port)
+        self.url = self.url.replace('~', os.path.expanduser('~').replace('/', '%2f'))
 
     def send_request(self, request):
         """
@@ -378,38 +327,15 @@ class Client(object):
         the plugin's specified response class if one exists, otherwise it will
         be an APIResponse.
         """
-        if not self.sock:
-            raise NotConnectedError()
+        # default to an empty response error
+        res = APIEmptyResponseErrorResponse()
 
-        # send the request data to the server
-        data = str(request)
-        log.debug("Sending request: {}".format(data))
-        while True:
-            try:
-                res = self.sock.sendall(data.encode('UTF-8'))
-                break
-            except socket.error as e:
-                if e.errno == errno.EINTR:
-                    continue
-                else:
-                    self.sock = None
-                    raise
-        if res != None:
-            log.error("Failed to send request: {}".format(request))
-            self.sock = None
-            raise SocketDisconnected("socket closed")
-
-        # receive response data
-        while True:
-            try:
-                data = self.sock.recv(READ_MAX).decode('UTF-8')
-                break
-            except socket.error as e:
-                if e.errno == errno.EINTR:
-                    continue
-                else:
-                    raise
-        if len(data) > 0:
+        # perform the request
+        response = self.session.post(self.url, data=str(request))
+        data = response.text
+        if response.status_code != 200:
+            res = APIGenericErrorResponse(response.text)
+        elif data and len(data) > 0:
             log.debug('Client received message: ' + data)
 
             try:
@@ -432,9 +358,26 @@ class Client(object):
                 log.exception('Exception parsing message: ' + str(e))
                 log.error('Invalid message: ' + data)
         else:
-            raise SocketDisconnected("socket closed")
+            res = APIEmptyResponseErrorResponse()
 
         return res
+
+    def send_requests(self, *args):
+        """
+        Send a set of requests.
+
+        Each request is sent over its own connection and the function will
+        return when all the requests have been fulfilled.
+        """
+        threads = [ClientThread(self, req) for req in args]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        exceptions = [t.exception for t in threads if t.exception]
+        if len(exceptions):
+            raise exceptions[0]
+        return [t.response for t in threads]
 
     def create_request(self, request_type, *args, **kwargs):
         """
@@ -461,70 +404,3 @@ class Client(object):
         res = self.send_request(req)
 
         return res
-
-
-class SocketDisconnected(Exception):
-    """
-    Exception raised when a socket disconnects.
-    """
-    pass
-
-
-class BaseSocket(object):
-    """
-    Base socket class from which ServerSocket and ClientSocket inherit.
-    """
-    def fileno(self):
-        return self.sock.fileno()
-
-    def close(self):
-        self.sock.close()
-
-    def send(self, buf):
-        self.sock.sendall(buf)
-
-
-class ServerSocket(BaseSocket):
-    """
-    Server socket for accepting new client connections.
-    """
-    def __init__(self, sock):
-        if isinstance(sock, STRTYPES):
-            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        elif isinstance(sock, tuple):
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.bind(sock)
-        self.sock.listen(1)
-
-    def accept(self):
-        pair = self.sock.accept()
-        if pair is not None:
-            sock, addr = pair
-            try:
-                return ClientSocket(sock)
-            except Exception as e:
-                log.exception("Exception handling accept: " + str(e))
-
-
-class ClientSocket(BaseSocket):
-    """
-    Client socket for communicating with an individual client. Collected by
-    ServerThread.
-    """
-    def __init__(self, sock):
-        self.sock = sock
-
-    def recv_request(self):
-        # read request from socket
-        data = self.sock.recv(READ_MAX).decode('UTF-8').strip()
-
-        log.debug("Received request client -> server: {}".format(data))
-
-        if len(data) == 0:
-            raise SocketDisconnected()
-
-        return data
-
-    def send_response(self, response):
-        log.debug("Sending response server -> client: {}".format(response))
-        self.send(response)

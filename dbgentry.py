@@ -66,11 +66,12 @@ try:
                 self.register_hooks()
             elif 'stopped' in command or 'update' in command:
                 self.adaptor.update_state()
+                self.server.dispatch_queue()
             else:
                 print("Usage: voltron <init|status|debug|update>")
 
         def status(self):
-            if self.server != None:
+            if self.server is not None:
                 summs = self.server.client_summary()
                 print("The following listeners are active:")
                 listen = voltron.config['server']['listen']
@@ -85,7 +86,6 @@ try:
                     print("  " + summary)
             else:
                 print("Server is not running (no inferior)")
-
 
     if in_lldb:
         class VoltronLLDBCommand (VoltronCommand):
@@ -115,6 +115,7 @@ try:
                 # start the server
                 self.server = Server()
                 self.server.start()
+                voltron.server = self.server
 
                 self.hook_idx = None
 
@@ -124,7 +125,7 @@ try:
             def register_hooks(self):
                 try:
                     output = self.adaptor.command("target stop-hook list")
-                    if not 'voltron' in output:
+                    if 'voltron' not in output:
                         output = self.adaptor.command('target stop-hook add -o \'voltron stopped\'')
                         try:
                             # hahaha this sucks
@@ -143,7 +144,7 @@ try:
             """
             Called by LLDB when the module is loaded
             """
-            if not 'cmd' in env_dict:
+            if 'cmd' not in env_dict:
                 log.debug("Initialising LLDB command")
                 env_dict['cmd'] = VoltronLLDBCommand(debugger, env_dict)
                 print(blessed.Terminal().bold_red("Voltron loaded."))
@@ -155,7 +156,6 @@ try:
             Called when the voltron command is invoked within LLDB
             """
             env_dict['cmd'].invoke(debugger, command, result, env_dict)
-
 
     if in_gdb:
         class VoltronGDBCommand (VoltronCommand, gdb.Command):
@@ -193,12 +193,13 @@ try:
 
             def stop_handler(self, event):
                 self.adaptor.update_state()
+                self.server.dispatch_queue()
                 log.debug('Inferior stopped')
 
             def exit_handler(self, event):
                 log.debug('Inferior exited')
                 self.server.stop()
-                
+
             def stop_and_exit_handler(self, event):
                 log.debug('Inferior stopped and exited')
                 self.stop_handler(event)
@@ -210,12 +211,10 @@ try:
                     self.server = Server()
                     self.server.start()
 
-
         if __name__ == "__main__":
             log.debug('Initialising GDB command')
             inst = VoltronGDBCommand()
             print(blessed.Terminal().bold_red("Voltron loaded."))
-
 
     if in_vdb:
         class VoltronVDBCommand(VoltronCommand, vtrace.Notifier):
@@ -276,7 +275,6 @@ try:
             def cont_handler(self, event):
                 log.debug('Inferior continued')
 
-
         # wb: i have no idea if this __name__ test is actually correct
         # but __builtin__ is its value when run from vdbbin
         if __name__ == "__builtin__":
@@ -290,4 +288,13 @@ except Exception as e:
     msg = "Exception {} raised while loading Voltron: {}".format(type(e), str(e))
     if blessed:
         msg = blessed.Terminal().bold_red(msg)
+    try:
+        import platform
+        if platform.system() == 'Linux':
+            print("--------------------------------------------------------------------------")
+            print("Install Voltron using `pip3` on Ubuntu. See the wiki for more information.")
+            print("--------------------------------------------------------------------------")
+    except:
+        pass
+
     print(msg)
