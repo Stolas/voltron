@@ -1,7 +1,5 @@
 from __future__ import print_function
 
-import re
-import shlex
 import struct
 import string
 import logging
@@ -12,6 +10,7 @@ from voltron.plugin import *
 from voltron.dbg import *
 
 try:
+    import vtrace
     import vdb
     import envi
     HAVE_VDB = True
@@ -56,10 +55,10 @@ if HAVE_VDB:
             }
         }
 
-        def __init__(self, vdb, vtrace, *args, **kwargs):
+        def __init__(self, host, *args, **kwargs):
             self.listeners = []
             self.host_lock = threading.RLock()
-            self._vdb = vdb
+            self._vdb = host
             self._vtrace = vtrace
 
         def version(self):
@@ -86,7 +85,7 @@ if HAVE_VDB:
             d = {}
             d["id"] = 0
             d["state"] = self._state()
-            d["file"] = shlex.split(self._vdb.getTrace().getMeta("ExecCommand"))[0]
+            d["file"] = self._vdb.getTrace().metadata['ExeName']
             d["arch"] = self.get_arch()
             d['byte_order'] = self.get_byte_order()
             d['addr_size'] = self.get_addr_size()
@@ -322,7 +321,6 @@ if HAVE_VDB:
             else:
                 raise NotAStringError()
 
-
         @validate_busy
         @validate_target
         @lock_host
@@ -406,6 +404,17 @@ if HAVE_VDB:
             """
             return "intel"
 
+        def capabilities(self):
+            """
+            Return a list of the debugger's capabilities.
+
+            Thus far only the 'async' capability is supported. This indicates
+            that the debugger host can be queried from a background thread,
+            and that views can use non-blocking API requests without queueing
+            requests to be dispatched next time the debugger stops.
+            """
+            return ['async']
+
         #
         # Private functions
         #
@@ -468,6 +477,56 @@ if HAVE_VDB:
             return "little"
 
 
+    class VDBCommand(DebuggerCommand, vtrace.Notifier):
+        """
+        Debugger command class for VDB
+        """
+        def __init__(self, host):
+            """
+            vdb is the debugger instance
+            vtrace is the vtrace module?
+            """
+            super(VDBCommand, self).__init__()
+            self._vdb = host
+            self._vtrace = vtrace
+            self.register_hooks()
+
+        def invoke(self, arg, from_tty):
+            self.handle_command(arg)
+
+        def register_hooks(self):
+            self._vdb.registerNotifier(vtrace.NOTIFY_ALL, self)
+
+        def unregister_hooks(self):
+            self._vdb.deregisterNotifier(vtrace.NOTIFY_ALL, self)
+
+        def notify(self, event, trace):
+            if event == self._vtrace.NOTIFY_DETACH:
+                self.exit_handler(event)
+            elif event == self._vtrace.NOTIFY_EXIT:
+                self.exit_handler(event)
+            elif event == self._vtrace.NOTIFY_BREAK:
+                self.stop_handler(event)
+            elif event == self._vtrace.NOTIFY_STEP:
+                self.stop_handler(event)
+            elif event == self._vtrace.NOTIFY_CONTINUE:
+                self.cont_handler(event)
+
+        def stop_handler(self, event):
+            self.adaptor.update_state()
+            voltron.server.dispatch_queue()
+            log.debug('Inferior stopped')
+
+        def exit_handler(self, event):
+            log.debug('Inferior exited')
+            voltron.server.cancel_queue()
+            voltron.server.stop()
+
+        def cont_handler(self, event):
+            log.debug('Inferior continued')
+
+
     class VDBAdaptorPlugin(DebuggerAdaptorPlugin):
         host = 'vdb'
         adaptor_class = VDBAdaptor
+        command_class = VDBCommand

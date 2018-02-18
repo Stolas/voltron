@@ -58,7 +58,8 @@ if HAVE_LLDB:
             Returns None for any fields that can't be elided
             """
 
-            arch, platform, abi = triple.split("-")
+            s = triple.split("-")
+            arch, platform, abi = s[0], s[1], '-'.join(s[2:])
             if arch == "x86_64h":
                 arch = "x86_64"
             return (arch, platform, abi)
@@ -204,12 +205,15 @@ if HAVE_LLDB:
                     except:
                         reg = None
                 elif reg.num_children > 0:
-                    children = []
-                    for i in xrange(reg.GetNumChildren()):
-                        children.append(int(reg.GetChildAtIndex(i, lldb.eNoDynamicValues, True).value, 16))
-                    if t_info['byte_order'] == 'big':
-                        children = list(reversed(children))
-                    val = int(codecs.encode(struct.pack('{}B'.format(len(children)), *children), 'hex'), 16)
+                    try:
+                        children = []
+                        for i in xrange(reg.GetNumChildren()):
+                            children.append(int(reg.GetChildAtIndex(i, lldb.eNoDynamicValues, True).value, 16))
+                        if t_info['byte_order'] == 'big':
+                            children = list(reversed(children))
+                        val = int(codecs.encode(struct.pack('{}B'.format(len(children)), *children), 'hex'), 16)
+                    except:
+                        pass
                 if registers == [] or reg.name in registers:
                     regs[reg.name] = val
 
@@ -389,9 +393,10 @@ if HAVE_LLDB:
             if command:
                 res = lldb.SBCommandReturnObject()
                 ci = self.host.GetCommandInterpreter()
-                ci.HandleCommand(str(command), res)
+                ci.HandleCommand(str(command), res, False)
                 if res.Succeeded():
-                    return res.GetOutput().strip()
+                    output = res.GetOutput()
+                    return output.strip() if output else ""
                 else:
                     raise Exception(res.GetError().strip())
             else:
@@ -468,6 +473,32 @@ if HAVE_LLDB:
 
             return breakpoints
 
+        @validate_busy
+        @validate_target
+        @lock_host
+        def backtrace(self, target_id=0, thread_id=None):
+            """
+            Return a list of stack frames.
+            """
+            target = self.host.GetTargetAtIndex(target_id)
+            if not thread_id:
+                thread_id = target.process.selected_thread.id
+            try:
+                thread = target.process.GetThreadByID(thread_id)
+            except:
+                raise NoSuchThreadException()
+
+            frames = []
+            for frame in thread:
+                start_addr = frame.GetSymbol().GetStartAddress().GetFileAddress()
+                offset = frame.addr.GetFileAddress() - start_addr
+                ctx = frame.GetSymbolContext(lldb.eSymbolContextEverything)
+                mod = ctx.GetModule()
+                name = '{mod}`{symbol} + {offset}'.format(mod=os.path.basename(str(mod.file)), symbol=frame.name, offset=offset)
+                frames.append({'index': frame.idx, 'addr': frame.addr.GetFileAddress(), 'name': name})
+
+            return frames
+
         def capabilities(self):
             """
             Return a list of the debugger's capabilities.
@@ -489,9 +520,10 @@ if HAVE_LLDB:
 
             # method invocation creator
             def create_invocation(obj):
-                def invoke(debugger, command, result, env_dict):
+                @staticmethod
+                def invoker(debugger, command, result, env_dict):
                     obj.invoke(*command.split())
-                return invoke
+                return invoker
 
             # store the invocation in `voltron.commands` to pass to LLDB
             setattr(voltron.commands, name, create_invocation(cls()))
@@ -500,6 +532,53 @@ if HAVE_LLDB:
             self.host.HandleCommand("command script add -f voltron.commands.{} {}".format(name, name))
 
 
+    class LLDBCommand(DebuggerCommand):
+        """
+        Debugger command class for LLDB
+        """
+        @staticmethod
+        def _invoke(debugger, command, *args):
+            voltron.command.handle_command(command)
+
+        def __init__(self):
+            super(LLDBCommand, self).__init__()
+
+            self.hook_idx = None
+            self.adaptor = voltron.debugger
+
+            # install the voltron command handler
+            self.adaptor.command("script import voltron")
+            self.adaptor.command('command script add -f entry.invoke voltron')
+
+            # try to register hooks automatically, as this works on new LLDB versions
+            self.register_hooks(True)
+
+        def invoke(self, debugger, command, result, dict):
+            self.handle_command(command)
+
+        def register_hooks(self, quiet=False):
+            try:
+                output = self.adaptor.command("target stop-hook list")
+                if 'voltron' not in output:
+                    output = self.adaptor.command('target stop-hook add -o \'voltron stopped\'')
+                    try:
+                        # hahaha this sucks
+                        self.hook_idx = int(res.GetOutput().strip().split()[2][1:])
+                    except:
+                        pass
+                self.registered = True
+                if not quiet:
+                    print("Registered stop-hook")
+            except:
+                if not quiet:
+                    print("No targets")
+
+        def unregister_hooks(self):
+            self.adaptor.command('target stop-hook delete {}'.format(self.hook_idx if self.hook_idx else ''))
+            self.registered = False
+
+
     class LLDBAdaptorPlugin(DebuggerAdaptorPlugin):
         host = 'lldb'
         adaptor_class = LLDBAdaptor
+        command_class = LLDBCommand

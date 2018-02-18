@@ -1,7 +1,7 @@
 import voltron
 import logging
-import base64
 import six
+import struct
 
 from voltron.api import *
 
@@ -36,6 +36,8 @@ class APIMemoryRequest(APIRequest):
 
     `deref` is a flag indicating whether or not to dereference any pointers
     within the memory region read.
+
+    `offset` is an offset to add to the address at which to start reading.
     """
     _fields = {
         'target_id': False,
@@ -44,7 +46,8 @@ class APIMemoryRequest(APIRequest):
         'words': False,
         'register': False,
         'command': False,
-        'deref': False
+        'deref': False,
+        'offset': False
     }
 
     target_id = 0
@@ -62,7 +65,7 @@ class APIMemoryRequest(APIRequest):
             if self.address:
                 addr = self.address
             elif self.command:
-                output = voltron.debugger.command(self.args.command)
+                output = voltron.debugger.command(self.command)
                 if output:
                     for item in reversed(output.split()):
                         log.debug("checking item: {}".format(item))
@@ -78,20 +81,29 @@ class APIMemoryRequest(APIRequest):
             elif self.register:
                 regs = voltron.debugger.registers(registers=[self.register])
                 addr = list(regs.values())[0]
+            if self.offset:
+                if self.words:
+                    addr += self.offset * target['addr_size']
+                else:
+                    addr += self.offset
 
             # read memory
-            memory = voltron.debugger.memory(address=addr, length=self.length, target_id=self.target_id)
+            memory = voltron.debugger.memory(address=int(addr), length=int(self.length), target_id=int(self.target_id))
 
             # deref pointers
             deref = None
             if self.deref:
                 fmt = ('<' if target['byte_order'] == 'little' else '>') + {2: 'H', 4: 'L', 8: 'Q'}[target['addr_size']]
                 deref = []
-                for chunk in zip(*[six.iterbytes(memory)]*target['addr_size']):
+                for chunk in zip(*[six.iterbytes(memory)] * target['addr_size']):
                     chunk = ''.join([six.unichr(x) for x in chunk]).encode('latin1')
-                    try:
-                        deref.append(voltron.debugger.dereference(pointer=list(struct.unpack(fmt, chunk))[0]))
-                    except:
+                    p = list(struct.unpack(fmt, chunk))[0]
+                    if p > 0:
+                        try:
+                            deref.append(voltron.debugger.dereference(pointer=p))
+                        except:
+                            deref.append([])
+                    else:
                         deref.append([])
 
             res = APIMemoryResponse()
@@ -104,7 +116,7 @@ class APIMemoryRequest(APIRequest):
         except NoSuchTargetException:
             res = APINoSuchTargetErrorResponse()
         except Exception as e:
-            msg = "Exception getting memory from debugger: {}".format(e)
+            msg = "Exception getting memory from debugger: {}".format(repr(e))
             log.exception(msg)
             res = APIGenericErrorResponse(msg)
 

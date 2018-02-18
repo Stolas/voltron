@@ -16,6 +16,7 @@ import time
 import logging
 import pexpect
 import os
+import six
 
 from mock import Mock
 from nose.tools import *
@@ -55,7 +56,11 @@ def teardown():
 def start_debugger(do_break=True):
     global p, client
     p = pexpect.spawn('gdb')
-    p.sendline("source dbgentry.py")
+    p.sendline("python import sys;sys.path.append('/home/travis/virtualenv/python3.5.0/lib/python3.5/site-packages')")
+    p.sendline("python import sys;sys.path.append('/home/travis/virtualenv/python3.4.3/lib/python3.4/site-packages')")
+    p.sendline("python import sys;sys.path.append('/home/travis/virtualenv/python3.3.6/lib/python3.3/site-packages')")
+    p.sendline("python import sys;sys.path.append('/home/travis/virtualenv/python2.7.10/lib/python2.7/site-packages')")
+    p.sendline("source voltron/entry.py")
     p.sendline("file tests/inferior")
     p.sendline("set disassembly-flavor intel")
     p.sendline("voltron init")
@@ -64,7 +69,7 @@ def start_debugger(do_break=True):
     p.sendline("run loop")
     read_data()
 
-    time.sleep(2)
+    time.sleep(5)
 
     client = Client()
 
@@ -79,7 +84,7 @@ def read_data():
     try:
         while True:
             data = p.read_nonblocking(size=64, timeout=1)
-            # print(data, end='')
+            print(data.decode('UTF-8'), end='')
     except:
         pass
 
@@ -153,3 +158,19 @@ def test_disassemble():
     assert res.status == 'success'
     assert len(res.disassembly) > 0
     assert 'DWORD' in res.disassembly
+
+
+def test_backtrace():
+    res = client.perform_request('backtrace')
+    print(res)
+    assert res.is_success
+    assert res.frames[0]['name'] == "main"
+    assert res.frames[0]['index'] == 0
+
+
+# def test_write_memory():
+#     value = six.b("AAAAAAAA")
+#     res = client.perform_request('write_memory', address=registers['rsp'], value=value)
+#     assert res.is_success
+#     res = client.perform_request('memory', address=registers['rsp'], length=len(value))
+#     assert res.memory == value

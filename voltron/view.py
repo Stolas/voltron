@@ -6,27 +6,26 @@ import logging
 import pprint
 import re
 import signal
-import time
 import argparse
-import traceback
-from requests import ConnectionError
+import subprocess
+import socket
 from blessed import Terminal
 
 try:
-    import pygments
-    import pygments.lexers
-    import pygments.formatters
-    have_pygments = True
+    import urwid
 except:
-    have_pygments = False
+    urwid = None
 
-from collections import defaultdict
+try:
+    import cursor
+except:
+    cursor = None
 
-from scruffy import Config
-
-from .core import *
-from .colour import *
+import voltron
+from .core import Client
+from .colour import fmt_esc
 from .plugin import *
+from .api import BlockingNotSupportedError
 
 log = logging.getLogger("view")
 
@@ -42,7 +41,6 @@ SHORT_ADDR_FORMAT_16 = '{0:0=4X}'
 
 # https://gist.github.com/sampsyo/471779
 class AliasedSubParsersAction(argparse._SubParsersAction):
-
     class _AliasedPseudoAction(argparse.Action):
         def __init__(self, name, aliases, help):
             dest = name
@@ -52,12 +50,7 @@ class AliasedSubParsersAction(argparse._SubParsersAction):
             sup.__init__(option_strings=[], dest=dest, help=help)
 
     def add_parser(self, name, **kwargs):
-        if 'aliases' in kwargs:
-            aliases = kwargs['aliases']
-            del kwargs['aliases']
-        else:
-            aliases = []
-
+        aliases = kwargs.pop('aliases', [])
         parser = super(AliasedSubParsersAction, self).add_parser(name, **kwargs)
 
         # Make the aliases work.
@@ -82,12 +75,12 @@ class AnsiString(object):
         if len(chunks) > 1:
             for chunk in chunks[1:]:
                 if chunk == '(B':
-                    chars.append('\033'+chunk)
+                    chars.append('\033' + chunk)
                 else:
                     p = chunk.find('m')
                     if p > 0:
-                        chars.append('\033'+chunk[:p+1])
-                        chars.extend(list(chunk[p+1:]))
+                        chars.append('\033' + chunk[:p + 1])
+                        chars.extend(list(chunk[p + 1:]))
                     else:
                         chars.extend(list(chunk))
 
@@ -118,6 +111,16 @@ class AnsiString(object):
 
     def clean(self):
         return re.sub('\033\[.{1,2}m', '', str(self))
+
+
+def requires_async(func):
+    def inner(self, *args, **kwargs):
+        if not self.block:
+            return func(self, *args, **kwargs)
+        else:
+            sys.stdout.write('\a')
+            sys.stdout.flush()
+    return inner
 
 
 class VoltronView (object):
@@ -169,6 +172,7 @@ class VoltronView (object):
         # Commonly set by render method for header and footer formatting
         self.title = ''
         self.info = ''
+        self.body = ''
 
         # Build configuration
         self.build_config()
@@ -186,7 +190,10 @@ class VoltronView (object):
             self.config.footer.show = self.args.footer
 
         # Setup a SIGWINCH handler so we do reasonable things on resize
-        signal.signal(signal.SIGWINCH, self.sigwinch_handler)
+        try:
+            signal.signal(signal.SIGWINCH, self.sigwinch_handler)
+        except:
+            pass
 
     def build_config(self):
         # Start with all_views config
@@ -217,51 +224,7 @@ class VoltronView (object):
     def cleanup(self):
         log.debug('Base view class cleanup')
 
-    def run(self):
-        res = None
-        os.system('clear')
-
-        while True:
-            try:
-                # get the server version
-                if not self.server_version:
-                    self.server_version = self.client.perform_request('version')
-
-                    # if the server supports async mode, use it, as some views may only work in async mode
-                    if self.server_version.capabilities and 'async' in self.server_version.capabilities:
-                        self.block = False
-                    elif self.supports_blocking:
-                        self.block = True
-                    else:
-                        raise BlockingNotSupportedError("Debugger requires blocking mode")
-
-                # render the view. if this view is running in asynchronous mode, the view should return immediately.
-                self.render()
-
-                # if the view is not blocking (server supports async || view doesn't support sync), block until the
-                # debugger stops again
-                if not self.block:
-                    done = False
-                    while not done:
-                        res = self.client.perform_request('version', block=True)
-                        if res.is_success:
-                            done = True
-            except ConnectionError as e:
-                # what the hell, requests? a message is a message, not a fucking nested error object
-                try:
-                    msg = e.message.args[1].strerror
-                except:
-                    try:
-                        msg = e.message.args[0]
-                    except:
-                        msg = str(e)
-                traceback.print_exc()
-                # if we're not connected, render an error and try again in a second
-                self.do_render(error='Error: {}'.format(msg))
-                self.server_version = None
-                time.sleep(1)
-
-    def render(self):
+    def render(self, results):
         log.warning('Might wanna implement render() in this view eh')
 
     def do_render(error=None):
@@ -278,29 +241,38 @@ class VoltronView (object):
 
 
 class TerminalView (VoltronView):
+    valid_key_funcs = ["exit", "page_up", "page_down", "page_up", "page_down",
+                       "line_up", "line_down", "reset"]
+
     def __init__(self, *a, **kw):
-        # Initialise window
         self.init_window()
+        self.trunc_top = False
+        self.done = False
+        self.last_body = None
+        self.scroll_offset = 0
         super(TerminalView, self).__init__(*a, **kw)
 
     def init_window(self):
-        # Hide cursor
-        os.system('tput civis')
+        self.t = Terminal()
+        print(self.t.civis)
+        if cursor:
+            cursor.hide()
 
     def cleanup(self):
         log.debug('Cleaning up view')
-        os.system('tput cnorm')
+        print(self.t.cnorm)
+        if cursor:
+            cursor.show()
 
     def clear(self):
+        # blessed's clear doesn't work properly on windaz
+        # maybe figure out the right way to do it some time
         os.system('clear')
 
-    def render(self):
+    def render(self, results):
         self.do_render()
 
     def do_render(self, error=None):
-        # Clear the screen
-        self.clear()
-
         # If we got an error, we'll use that as the body
         if error:
             self.body = self.colour(error, 'red')
@@ -312,26 +284,32 @@ class TerminalView (VoltronView):
         self.pad_body()
         self.truncate_body()
 
-        # Print the header, body and footer
-        try:
-            if self.config.header.show:
-                print(self.format_header_footer(self.config.header))
-            print(self.fmt_body, end='')
-            if self.config.footer.show:
-                print('\n' + self.format_header_footer(self.config.footer), end='')
-            sys.stdout.flush()
-        except IOError as e:
-            # if we get an EINTR while printing, just do it again
-            if e.errno == socket.EINTR:
-                self.do_render()
+        if self.body != self.last_body:
+            # Clear the screen
+            self.clear()
+
+            # Print the header, body and footer
+            try:
+                if self.config.header.show:
+                    print(self.format_header_footer(self.config.header))
+                print(self.fmt_body, end='')
+                if self.config.footer.show:
+                    print('\n' + self.format_header_footer(self.config.footer), end='')
+                sys.stdout.flush()
+            except IOError as e:
+                # if we get an EINTR while printing, just do it again
+                if e.errno == socket.EINTR:
+                    self.do_render()
+
+        self.last_body = self.body
 
     def sigwinch_handler(self, sig, stack):
         self.do_render()
 
     def window_size(self):
-        height, width = os.popen('stty size').read().split()
-        height = int(height)
-        width = int(width)
+        height, width = subprocess.check_output(['stty', 'size']).split()
+        height = int(height) - int(self.config.pad.pad_bottom)
+        width = int(width) - int(self.config.pad.pad_right)
         return (height, width)
 
     def body_height(self):
@@ -344,12 +322,12 @@ class TerminalView (VoltronView):
 
     def colour(self, text='', colour=None, background=None, attrs=[]):
         s = ''
-        if colour != None:
+        if colour:
             s += fmt_esc(colour)
-        if background != None:
-            s += fmt_esc('b_'+background)
+        if background:
+            s += fmt_esc('b_' + background)
         if attrs != []:
-            s += ''.join(map(lambda x: fmt_esc('a_'+x), attrs))
+            s += ''.join(map(lambda x: fmt_esc('a_' + x), attrs))
         s += text
         s += fmt_esc('reset')
         return s
@@ -370,7 +348,7 @@ class TerminalView (VoltronView):
         p = self.colour(p, c.colour, c.bg_colour, c.attrs)
 
         # Build
-        data = l + (width - llen - rlen)*p + r
+        data = l + (width - llen - rlen) * p + r
 
         return data
 
@@ -380,7 +358,7 @@ class TerminalView (VoltronView):
         pad = self.body_height() - len(lines)
         if pad < 0:
             pad = 0
-        self.fmt_body += int(pad)*'\n'
+        self.fmt_body += int(pad) * '\n'
 
     def truncate_body(self):
         height, width = self.window_size()
@@ -390,19 +368,97 @@ class TerminalView (VoltronView):
         for line in self.fmt_body.split('\n'):
             s = AnsiString(line)
             if len(s) > width:
-                line = s[:width-1] + self.colour('>', 'red')
+                line = s[:width - 1] + self.colour('>', 'red')
             lines.append(line)
 
         # truncate body vertically
-        lines = lines[:self.body_height()]
+        if len(lines) > self.body_height():
+            if self.trunc_top:
+                lines = lines[len(lines) - self.body_height():]
+            else:
+                lines = lines[:self.body_height()]
 
         self.fmt_body = '\n'.join(lines)
 
+    def build_requests(self):
+        """
+        Build requests for this view. Concrete view subclasses must implement
+        this.
+        """
+        return []
 
-def merge(d1, d2):
-    for k1,v1 in d1.items():
-        if isinstance(v1, dict) and k1 in d2.keys() and isinstance(d2[k1], dict):
-            merge(v1, d2[k1])
-        else:
-            d2[k1] = v1
-    return d2
+    def run(self):
+        """
+        Run the view event loop.
+        """
+        def render(results=[], error=None):
+            if len(results) and not results[0].timed_out:
+                self.render(results)
+            elif error:
+                self.do_render(error=error)
+
+        # start the client
+        self.client.start(self.build_requests, render)
+
+        # handle keyboard input
+        try:
+            with self.t.cbreak():
+                val = ''
+                while not self.done:
+                    val = self.t.inkey(timeout=1)
+                    if val:
+                        self.handle_key(val)
+        except KeyboardInterrupt:
+            self.exit()
+
+    def handle_key(self, key):
+        """
+        Handle a keypress. Concrete subclasses can implement this method if
+        custom keypresses need to be handled other than for exit and scrolling.
+        """
+        try:
+            func = None
+            if key.is_sequence:
+                try:
+                    func = self.config.keymap[key.name]
+                except:
+                    try:
+                        func = self.config.keymap[key.code]
+                    except:
+                        func = self.config.keymap[str(key)]
+            else:
+                func = self.config.keymap[str(key)]
+
+            if func in self.valid_key_funcs:
+                getattr(self, func)()
+        except:
+            raise
+
+    def exit(self):
+        self.cleanup()
+        os._exit(0)
+
+    @requires_async
+    def page_up(self):
+        self.scroll_offset += self.body_height()
+        self.client.update()
+
+    @requires_async
+    def page_down(self):
+        self.scroll_offset -= self.body_height()
+        self.client.update()
+
+    @requires_async
+    def line_up(self):
+        self.scroll_offset += 1
+        self.client.update()
+
+    @requires_async
+    def line_down(self):
+        self.scroll_offset -= 1
+        self.client.update()
+
+    @requires_async
+    def reset(self):
+        self.scroll_offset = 0
+        self.client.update()

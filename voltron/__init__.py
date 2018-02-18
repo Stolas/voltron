@@ -11,13 +11,13 @@ from scruffy import Environment, Directory, File, ConfigFile, PluginDirectory, P
 env = None
 config = None
 
-# reference to debugger adaptor
 debugger = None
-
-# plugin commands
+command = None
 commands = None
+server = None
 
 loaded = False
+
 
 def setup_env():
     global env, config
@@ -32,8 +32,7 @@ def setup_env():
     )
     config = env.config
 
-    # create shared instance of plugin manager
-    voltron.plugin.pm = voltron.plugin.PluginManager()
+    voltron.plugin.pm.register_plugins()
 
 LOGGER_DEFAULT = {
     'handlers': ['null'],
@@ -66,6 +65,7 @@ LOG_CONFIG = {
     }
 }
 
+
 def setup_logging(logname=None):
     # configure logging
     logging.config.dictConfig(LOG_CONFIG)
@@ -73,7 +73,7 @@ def setup_logging(logname=None):
     # enable the debug_file in all the loggers if the config says to
     if config and 'general' in config and config['general']['debug_logging']:
         if logname:
-            filename = 'voltron_{}.log'.format(logname)
+            filename = '{}.log'.format(logname)
         else:
             filename = 'voltron.log'
         for name in LOG_CONFIG['loggers']:
@@ -85,9 +85,11 @@ def setup_logging(logname=None):
 
     return logging.getLogger(logname)
 
+
 # Python 3 shim
 if not hasattr(__builtins__, "xrange"):
     xrange = range
+
 
 # Setup the Voltron environment
 setup_env()
